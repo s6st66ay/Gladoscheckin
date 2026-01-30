@@ -26,6 +26,9 @@ logger = logging.getLogger(__name__)
 ENV_PUSH_KEY = "PUSHDEER_SENDKEY"
 ENV_COOKIES = "GLADOS_COOKIES"
 ENV_EXCHANGE_PLAN = "GLADOS_EXCHANGE_PLAN"
+ENV_GOTIFY_URL = "GOTIFY_URL"
+ENV_GOTIFY_TOKEN = "GOTIFY_TOKEN"
+ENV_GOTIFY_PRIORITY = "GOTIFY_PRIORITY"
 
 # API URLs
 CHECKIN_URL = "https://glados.cloud/api/user/checkin"
@@ -47,10 +50,13 @@ HEADERS_TEMPLATE = {
 # Exchange Plan Points
 EXCHANGE_POINTS = {"plan100": 100, "plan200": 200, "plan500": 500} 
 
-def load_config() -> Tuple[str, List[str], str]:
+def load_config() -> Tuple[str, List[str], str, str, str, int]:
     push_key_env = os.environ.get(ENV_PUSH_KEY)
     raw_cookies_env = os.environ.get(ENV_COOKIES)
     exchange_plan_env = os.environ.get(ENV_EXCHANGE_PLAN)
+    gotify_url_env = os.environ.get(ENV_GOTIFY_URL)
+    gotify_token_env = os.environ.get(ENV_GOTIFY_TOKEN)
+    gotify_priority_env = os.environ.get(ENV_GOTIFY_PRIORITY)
 
     if not push_key_env:
         logger.warning(f"环境变量 '{ENV_PUSH_KEY}' 未设置。")
@@ -69,7 +75,7 @@ def load_config() -> Tuple[str, List[str], str]:
     if not exchange_plan_env:
         logger.warning(f"环境变量 '{ENV_EXCHANGE_PLAN}' 未设置，将使用默认兑换计划 'plan500'。")
         exchange_plan = "plan500"
-    else: 
+    else:
         if exchange_plan_env in EXCHANGE_POINTS:
              exchange_plan = exchange_plan_env
              logger.info(f"使用指定的兑换计划: {exchange_plan}")
@@ -77,12 +83,23 @@ def load_config() -> Tuple[str, List[str], str]:
             logger.warning(f"环境变量 '{ENV_EXCHANGE_PLAN}' 的值 '{exchange_plan_env}' 无效，将使用默认兑换计划 'plan500'。")
             exchange_plan = "plan500"
 
+    # Gotify 配置
+    gotify_url = gotify_url_env if gotify_url_env else ''
+    gotify_token = gotify_token_env if gotify_token_env else ''
+    gotify_priority = 5  # 默认优先级
+    if gotify_priority_env:
+        try:
+            gotify_priority = int(gotify_priority_env)
+        except ValueError:
+            logger.warning(f"环境变量 '{ENV_GOTIFY_PRIORITY}' 的值无效，将使用默认优先级 5。")
 
     logger.info(f"共加载了 {len(cookies_list)} 个 Cookie 用于签到。")
     logger.info(f"当前 {ENV_PUSH_KEY} {'已设置' if push_key_env else '未设置'}。")
+    logger.info(f"当前 {ENV_GOTIFY_URL} {'已设置' if gotify_url_env else '未设置'}。")
+    logger.info(f"当前 {ENV_GOTIFY_TOKEN} {'已设置' if gotify_token_env else '未设置'}。")
     logger.info(f"当前 {ENV_EXCHANGE_PLAN}: {exchange_plan}。")
 
-    return push_key, cookies_list, exchange_plan
+    return push_key, cookies_list, exchange_plan, gotify_url, gotify_token, gotify_priority
 
 
 def make_request(url: str, method: str, headers: Dict[str, str], data: Optional[Dict] = None, cookies: str = "") -> Optional[requests.Response]:
@@ -229,9 +246,46 @@ def format_push_content(results: List[Dict[str, str]]) -> Tuple[str, str]:
     return title, content
 
 
-def main():
+def send_gotify_message(url: str, token: str, title: str, message: str, priority: int = 5) -> bool:
+    """发送消息到 Gotify 服务器"""
+    if not url or not token:
+        return False
+
     try:
-        push_key, cookies_list, exchange_plan = load_config()
+        gotify_endpoint = f"{url}/message"
+        headers = {
+            'Content-Type': 'application/json',
+            'X-Gotify-Key': token
+        }
+        data = {
+            'title': title,
+            'message': message,
+            'priority': priority
+        }
+
+        response = requests.post(gotify_endpoint, headers=headers, json=data, timeout=10)
+        if response.status_code == 200:
+            logger.info("Gotify 消息发送成功。")
+            return True
+        else:
+            logger.warning(f"Gotify 消息发送失败，状态码: {response.status_code}, 响应: {response.text}")
+            return False
+    except requests.exceptions.RequestException as e:
+        logger.error(f"发送 Gotify 消息时发生网络错误: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"发送 Gotify 消息时发生错误: {e}")
+        return False
+
+
+def main():
+    push_key = ''
+    gotify_url = ''
+    gotify_token = ''
+    gotify_priority = 5
+
+    try:
+        push_key, cookies_list, exchange_plan, gotify_url, gotify_token, gotify_priority = load_config()
 
         if not cookies_list:
             logger.error("未找到有效的 Cookie，退出程序。")
@@ -257,15 +311,22 @@ def main():
         logger.error(f"主程序执行过程中发生未预期的错误: {e}")
         title, content = "# 脚本执行出错", str(e)
 
-    if not push_key:
-        logger.info(f"未设置 '{ENV_PUSH_KEY}'，跳过推送通知。")
-    else:
-        try:
-            pushdeer = PushDeer(pushkey=push_key)
-            pushdeer.send_text(title, desp=content)
-            logger.info("推送通知发送成功。")
-        except Exception as e:
-            logger.error(f"发送推送通知失败: {e}")
+    # 优先使用 Gotify 发送消息
+    gotify_sent = False
+    if gotify_url and gotify_token:
+        gotify_sent = send_gotify_message(gotify_url, gotify_token, title, content, gotify_priority)
+
+    # 如果 Gotify 未配置或发送失败，且配置了 PushDeer，则使用 PushDeer
+    if not gotify_sent:
+        if not push_key:
+            logger.info(f"未设置 '{ENV_PUSH_KEY}'，跳过 PushDeer 推送通知。")
+        else:
+            try:
+                pushdeer = PushDeer(pushkey=push_key)
+                pushdeer.send_text(title, desp=content)
+                logger.info("PushDeer 推送通知发送成功。")
+            except Exception as e:
+                logger.error(f"发送 PushDeer 推送通知失败: {e}")
 
 
 if __name__ == '__main__':
