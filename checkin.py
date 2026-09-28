@@ -5,7 +5,6 @@ import logging
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, asdict
-from pypushdeer import PushDeer
 from logging_config import init_logger
 
 
@@ -94,7 +93,8 @@ def log_method(func):
 class Config:
     """应用配置"""
 
-    ENV_PUSH_KEY = "PUSHDEER_SENDKEY"
+    ENV_GOTIFY_URL = "GOTIFY_URL"
+    ENV_GOTIFY_TOKEN = "GOTIFY_TOKEN"
     ENV_COOKIES = "GLADOS_COOKIES"
     ENV_EXCHANGE_PLAN = "GLADOS_EXCHANGE_PLAN"
     ENV_VERBOSE = "GLADOS_VERBOSE"
@@ -116,7 +116,8 @@ class Config:
     }
 
     def __init__(self):
-        self.push_key: str = ""
+        self.gotify_url: str = ""
+        self.gotify_token: str = ""
         self.cookies_list: List[str] = []
         self.exchange_plan: str = self.DEFAULT_EXCHANGE_PLAN
         self.verbose: bool = self.DEFAULT_VERBOSE
@@ -124,16 +125,19 @@ class Config:
 
     def _load_config(self) -> None:
         """加载配置"""
-        push_key_env: Optional[str] = os.environ.get(self.ENV_PUSH_KEY)
+        gotify_url_env: Optional[str] = os.environ.get(self.ENV_GOTIFY_URL)
+        gotify_token_env: Optional[str] = os.environ.get(self.ENV_GOTIFY_TOKEN)
         raw_cookies_env: Optional[str] = os.environ.get(self.ENV_COOKIES)
         exchange_plan_env: Optional[str] = os.environ.get(self.ENV_EXCHANGE_PLAN)
         verbose_env: Optional[str] = os.environ.get(self.ENV_VERBOSE)
 
-        if not push_key_env:
-            logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_PUSH_KEY}' 未设置。")
-            self.push_key = ""
-        else:
-            self.push_key = push_key_env
+        self.gotify_url = (gotify_url_env or "").strip()
+        self.gotify_token = (gotify_token_env or "").strip()
+
+        if not self.gotify_url:
+            logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_GOTIFY_URL}' 未设置，将跳过 Gotify 推送。")
+        if not self.gotify_token:
+            logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_GOTIFY_TOKEN}' 未设置，将跳过 Gotify 推送。")
 
         if not raw_cookies_env:
             logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_COOKIES}' 未设置。")
@@ -155,7 +159,8 @@ class Config:
                 self.exchange_plan = self.DEFAULT_EXCHANGE_PLAN
 
         logger.info(f"{LogEmoji.INFO} 共加载了 {len(self.cookies_list)} 个 Cookie 用于签到。")
-        logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_PUSH_KEY} {'已设置' if push_key_env else '未设置'}。")
+        logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_GOTIFY_URL} {'已设置' if self.gotify_url else '未设置'}。")
+        logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_GOTIFY_TOKEN} {'已设置' if self.gotify_token else '未设置'}。")
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_EXCHANGE_PLAN}: {self.exchange_plan}。")
 
         if verbose_env is not None:
@@ -391,24 +396,46 @@ class CheckinResult:
 
 
 class PushService:
-    """推送服务"""
+    """推送服务（Gotify）"""
 
-    def __init__(self, config: Config):
+    MESSAGE_PATH = "/message"
+    PRIORITY = 0
+    TIMEOUT = (10, 30)
+
+    def __init__(self, config: Optional[Config]):
         self.config = config
 
     def send(self, title: str, content: str) -> bool:
-        """发送推送"""
-        if not self.config.push_key:
-            logger.info(f"{LogEmoji.WARNING} 未设置推送密钥，跳过推送通知。")
+        """通过 Gotify 发送推送"""
+        gotify_url: str = getattr(self.config, "gotify_url", "") if self.config else ""
+        gotify_token: str = getattr(self.config, "gotify_token", "") if self.config else ""
+
+        if not gotify_url or not gotify_token:
+            logger.info(f"{LogEmoji.WARNING} 未配置 Gotify URL 或 Token，跳过推送通知。")
             return False
 
+        url = f"{gotify_url.rstrip('/')}{self.MESSAGE_PATH}"
+
         try:
-            pushdeer = PushDeer(pushkey=self.config.push_key)
-            pushdeer.send_text(title, desp=content)
-            logger.info(f"{LogEmoji.SUCCESS} 推送通知发送成功。")
-            return True
+            response = requests.post(
+                url,
+                params={"token": gotify_token},
+                data={"title": title, "message": content, "priority": self.PRIORITY},
+                timeout=self.TIMEOUT,
+            )
+
+            if response.status_code == 200:
+                logger.info(f"{LogEmoji.SUCCESS} Gotify 推送通知发送成功。")
+                return True
+
+            hint = "Token 无效" if response.status_code == 401 else "服务地址或请求参数有误"
+            logger.error(f"{LogEmoji.ERROR} Gotify 推送失败，状态码 {response.status_code}（{hint}）。响应内容: {response.text}")
+            return False
+        except requests.exceptions.RequestException as e:
+            logger.error(f"{LogEmoji.ERROR} 发送 Gotify 推送时发生网络错误: {e}")
+            return False
         except Exception as e:
-            logger.error(f"{LogEmoji.ERROR} 发送推送通知失败: {e}")
+            logger.error(f"{LogEmoji.ERROR} 发送 Gotify 推送通知失败: {e}")
             return False
 
 
@@ -525,6 +552,9 @@ logger = init_logger()
 
 def main():
     """主函数"""
+    config: Optional[Config] = None
+    title, content = "# 脚本执行异常", ""
+
     try:
         # 1. 加载配置
         logger.info(f"{LogEmoji.START} 步骤 1: 加载配置")
@@ -546,11 +576,11 @@ def main():
 
     except Exception as e:
         logger.error(f"{LogEmoji.ERROR} 主程序执行过程中发生未预期的错误: {e}")
-        title, content, log_content = "# 脚本执行出错", str(e), str(e)
+        title, content = "# 脚本执行出错", str(e)
 
     # 4. 发送推送
     logger.info(f"{LogEmoji.START} 步骤 4: 发送推送")
-    push_service = PushService(config if "config" in locals() else "")
+    push_service = PushService(config)
     push_service.send(title, content)
     logger.info(f"{LogEmoji.END} 签到完成")
 
