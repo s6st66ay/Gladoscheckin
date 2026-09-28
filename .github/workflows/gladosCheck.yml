@@ -41,14 +41,15 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install requests
-        pip install pypushdeer
 
     # 执行 签到脚本
     - name: Running checkin
       run: |
         python checkin.py
       env:
-        PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
+        GOTIFY_URL: ${{ secrets.GOTIFY_URL }}
+        # 兼容旧名称 GOTIFY_TOKENT，secret 改名后此行可简化为 ${{ secrets.GOTIFY_TOKEN }}
+        GOTIFY_TOKEN: ${{ secrets.GOTIFY_TOKEN || secrets.GOTIFY_TOKENT }}
         GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
         GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
         GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
