@@ -18,7 +18,6 @@ from logging_config import init_logger
 
 # --------------------------------------------------------------------------- #
 # 常量与枚举
-# --------------------------------------------------------------------------- #
 
 
 class CheckinStatus(Enum):
@@ -138,9 +137,7 @@ FALSY = ("false", "0", "no", "n")
 logger = logging.getLogger(__name__)
 
 
-# --------------------------------------------------------------------------- #
 # 纯工具函数
-# --------------------------------------------------------------------------- #
 
 
 def to_int(value: Any) -> Optional[int]:
@@ -249,9 +246,7 @@ class RunBudget:
         return time.monotonic() >= self.deadline
 
 
-# --------------------------------------------------------------------------- #
 # 数据模型
-# --------------------------------------------------------------------------- #
 
 
 @dataclass()
@@ -623,9 +618,7 @@ class Accounts:
         return entries
 
 
-# --------------------------------------------------------------------------- #
 # 签到响应解析：纯逻辑，不依赖 HTTP 会话，便于单独复用与推理
-# --------------------------------------------------------------------------- #
 
 
 def earned_points(raw: Dict) -> int:
@@ -691,9 +684,7 @@ def parse_checkin(raw: Optional[Dict], domain: str, log: Callable[..., None], ua
     return result
 
 
-# --------------------------------------------------------------------------- #
 # API：绑定 (域名, Cookie) 的单站点会话
-# --------------------------------------------------------------------------- #
 
 
 class API:
@@ -921,16 +912,14 @@ class API:
             return None
 
 
-# --------------------------------------------------------------------------- #
 # 配置
-# --------------------------------------------------------------------------- #
 
 
 class Config:
     """应用配置（来自环境变量）"""
 
-    ENV_PUSH_KEY = "PUSHDEER_SENDKEY"
-    ENV_SERVERCHAN_KEY = "SERVERCHAN_SENDKEY"
+    ENV_GOTIFY_URL = "GOTIFY_URL"
+    ENV_GOTIFY_TOKEN = "GOTIFY_TOKEN"
     ENV_COOKIES = "GLADOS_COOKIES"
     ENV_EXCHANGE_PLAN = "GLADOS_EXCHANGE_PLAN"
     ENV_VERBOSE = "GLADOS_VERBOSE"
@@ -940,8 +929,8 @@ class Config:
 
     def __init__(self, env: Optional[Dict[str, str]] = None):
         self.env = env if env is not None else os.environ
-        self.push_key = ""
-        self.serverchan_key = ""
+        self.gotify_url = ""
+        self.gotify_token = ""
         self.accounts = Accounts()
         self.exchange_plan = self.DEFAULT_EXCHANGE_PLAN
         self.verbose = self.DEFAULT_VERBOSE
@@ -959,7 +948,7 @@ class Config:
     # ---------------- 加载 ----------------
 
     def _load(self) -> None:
-        self._load_push_keys()
+        self._load_gotify_keys()
         # verbose 必须先加载：Accounts.parse 需要它来决定新建账号的 verbose 初值
         self._load_verbose()
         self._load_accounts()
@@ -968,19 +957,20 @@ class Config:
         logger.info(f"{LogEmoji.INFO} 共加载了 {len(self.accounts)} 个账号用于签到。")
         for account in self.accounts:
             logger.info(f"{LogEmoji.INFO} {LogEmoji.COOKIE}[{account.label}] {LogEmoji.DOMAIN}[{account.origin or '待探测'}] UA={'自定义' if account.user_agent else '默认'}")
-        logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_PUSH_KEY} {'已设置' if self.push_key else '未设置'}，" f"{self.ENV_SERVERCHAN_KEY} {'已设置' if self.serverchan_key else '未设置'}。")
+        logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_GOTIFY_URL} {'已设置' if self.gotify_url else '未设置'}，" f"{self.ENV_GOTIFY_TOKEN} {'已设置' if self.gotify_token else '未设置'}。")
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_EXCHANGE_PLAN}: {self.exchange_plan}。")
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_VERBOSE}: {self.verbose}。")
 
     def _get(self, key: str) -> str:
         return (self.env.get(key) or "").strip()
 
-    def _load_push_keys(self) -> None:
-        for key, env_name in (("push_key", self.ENV_PUSH_KEY), ("serverchan_key", self.ENV_SERVERCHAN_KEY)):
-            value = self._get(env_name)
-            setattr(self, key, value)
-            if not value:
-                logger.warning(f"{LogEmoji.WARNING} 环境变量 '{env_name}' 未设置。")
+    def _load_gotify_keys(self) -> None:
+        self.gotify_url = self._get(self.ENV_GOTIFY_URL)
+        self.gotify_token = self._get(self.ENV_GOTIFY_TOKEN)
+        if not self.gotify_url:
+            logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_GOTIFY_URL}' 未设置。")
+        if not self.gotify_token:
+            logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_GOTIFY_TOKEN}' 未设置。")
 
     def _load_accounts(self) -> None:
         raw = self._get(self.ENV_COOKIES)
@@ -1019,9 +1009,7 @@ class Config:
             logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_VERBOSE}' 的值 '{value}' 无效，将使用默认值 {self.DEFAULT_VERBOSE}。")
 
 
-# --------------------------------------------------------------------------- #
 # 报告与推送
-# --------------------------------------------------------------------------- #
 
 
 class Report:
@@ -1049,7 +1037,7 @@ class Report:
         return f"GLaDOS 签到 · 成功 {success} · 失败 {failed} · 重复 {repeat}"
 
     def render(self, line_sep: str = "\n") -> str:
-        """渲染正文。line_sep：PushDeer 用 \\n；Server酱 用 '  \\n'（Markdown 硬换行）"""
+        """渲染正文"""
         show_name = len(self.entries) > 1 and any(entry.name for entry in self.entries)
         lines = []
         for entry in self.entries:
@@ -1071,68 +1059,40 @@ class Report:
         return line_sep.join(lines)
 
 
-class PushBackend:
-    """推送后端抽象（策略模式）"""
+class GotifyBackend:
+    """Gotify 推送后端"""
 
-    name = "base"
+    name = "Gotify"
 
-    def send(self, report: Report) -> bool:
-        raise NotImplementedError
+    MESSAGE_PATH = "/message"
+    PRIORITY = 0
+    TIMEOUT = (10, 30)
 
-    def _render(self, report: Report) -> str:
-        """渲染正文，子类可覆盖行分隔方式"""
-        return report.render("\n")
-
-
-class PushDeerBackend(PushBackend):
-    """PushDeer 后端"""
-
-    name = "PushDeer"
-
-    def __init__(self, push_key: str):
-        self.push_key = push_key
+    def __init__(self, gotify_url: str, gotify_token: str):
+        self.gotify_url = gotify_url
+        self.gotify_token = gotify_token
 
     def send(self, report: Report) -> bool:
-        try:
-            from pypushdeer import PushDeer
-        except ImportError:
-            logger.error(f"{LogEmoji.ERROR} [{self.name}] 推送失败: 未安装 pypushdeer，请先执行 pip install pypushdeer。")
-            return False
+        """通过 Gotify 发送推送"""
+        url = f"{self.gotify_url.rstrip('/')}{self.MESSAGE_PATH}"
 
         try:
-            ok = PushDeer(pushkey=self.push_key).send_text(report.title, desp=self._render(report))
-            if not ok:
-                logger.error(f"{LogEmoji.ERROR} [{self.name}] 推送失败: 接口返回失败")
-            return bool(ok)
-        except Exception as e:  # noqa: BLE001 - 推送失败不应影响主流程
-            logger.error(f"{LogEmoji.ERROR} [{self.name}] 推送失败: {e}")
-            return False
+            response = requests.post(
+                url,
+                params={"token": self.gotify_token},
+                data={"title": report.title, "message": report.render("\n"), "priority": self.PRIORITY},
+                timeout=self.TIMEOUT,
+            )
 
-
-class ServerChanBackend(PushBackend):
-    """Server酱 后端"""
-
-    name = "Server酱"
-
-    def __init__(self, send_key: str):
-        self.send_key = send_key
-
-    def _render(self, report: Report) -> str:
-        # Server酱 按 Markdown 渲染，单 \n 不换行；行尾两空格 + \n 做硬换行，且不留段落间距
-        return report.render("  \n")
-
-    def send(self, report: Report) -> bool:
-        try:
-            from serverchan_sdk import sc_send
-        except ImportError:
-            logger.error(f"{LogEmoji.ERROR} [{self.name}] 推送失败: 未安装 serverchan_sdk，请先执行 pip install serverchan-sdk。")
-            return False
-
-        try:
-            resp = sc_send(sendkey=self.send_key, title=report.title, desp=self._render(report))
-            if isinstance(resp, dict) and resp.get("code") == 0:
+            if response.status_code == 200:
+                logger.info(f"{LogEmoji.SUCCESS} [{self.name}] 推送通知发送成功。")
                 return True
-            logger.error(f"{LogEmoji.ERROR} [{self.name}] 推送失败: 接口返回 {resp}")
+
+            hint = "Token 无效" if response.status_code == 401 else "服务地址或请求参数有误"
+            logger.error(f"{LogEmoji.ERROR} [{self.name}] 推送失败，状态码 {response.status_code}（{hint}）。响应内容: {response.text}")
+            return False
+        except requests.exceptions.RequestException as e:
+            logger.error(f"{LogEmoji.ERROR} [{self.name}] 推送失败: 网络错误: {e}")
             return False
         except Exception as e:  # noqa: BLE001 - 推送失败不应影响主流程
             logger.error(f"{LogEmoji.ERROR} [{self.name}] 推送失败: {e}")
@@ -1140,16 +1100,14 @@ class ServerChanBackend(PushBackend):
 
 
 class PushService:
-    """聚合多个推送后端，向全部已配置的后端发送（都发）"""
+    """推送服务：向已配置的后端发送推送"""
 
     def __init__(self, config: Optional[Config] = None):
-        self.backends: List[PushBackend] = []
+        self.backends: List[Any] = []
         if config is None:
             return
-        if config.push_key:
-            self.backends.append(PushDeerBackend(config.push_key))
-        if config.serverchan_key:
-            self.backends.append(ServerChanBackend(config.serverchan_key))
+        if config.gotify_url and config.gotify_token:
+            self.backends.append(GotifyBackend(config.gotify_url, config.gotify_token))
 
     def send(self, report: Report) -> bool:
         """向所有已配置后端发送，任一成功即视为成功"""
@@ -1167,9 +1125,7 @@ class PushService:
         return False
 
 
-# --------------------------------------------------------------------------- #
 # 编排
-# --------------------------------------------------------------------------- #
 
 
 class CheckinRunner:
@@ -1201,9 +1157,7 @@ class CheckinRunner:
         return Report(accounts)
 
 
-# --------------------------------------------------------------------------- #
 # 入口
-# --------------------------------------------------------------------------- #
 
 
 def main() -> None:
